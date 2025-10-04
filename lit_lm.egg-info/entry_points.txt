@@ -1,3 +1,0 @@
-[console_scripts]
-litlm-train = scripts.train:main
-
