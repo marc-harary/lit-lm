@@ -1,0 +1,2 @@
+pretrained_model_name_or_path: gpt2
+_instantiator: pytorch_lightning.cli.instantiate_module

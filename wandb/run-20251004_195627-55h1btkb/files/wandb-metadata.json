@@ -1,0 +1,42 @@
+{
+  "os": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.12",
+  "startedAt": "2025-10-04T19:56:27.753656Z",
+  "args": [
+    "fit",
+    "--config",
+    "configs/train.yaml"
+  ],
+  "program": "/home/ubuntu/lit-lm/scripts/train.py",
+  "codePath": "scripts/train.py",
+  "root": ".",
+  "host": "138-2-234-249",
+  "executable": "/usr/bin/python",
+  "codePathLocal": "scripts/train.py",
+  "cpu_count": 30,
+  "cpu_count_logical": 30,
+  "gpu": "NVIDIA A10",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "1456701079552",
+      "used": "83824873472"
+    }
+  },
+  "memory": {
+    "total": "238546477056"
+  },
+  "cpu": {
+    "count": 30,
+    "countLogical": 30
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA A10",
+      "memoryTotal": "24146608128",
+      "cudaCores": 9216,
+      "architecture": "Ampere"
+    }
+  ],
+  "cudaVersion": "12.8"
+}
