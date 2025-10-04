@@ -4,7 +4,7 @@ setup(
     name="lit-lm",
     version="0.1.0",
     description="Lightning-based training framework for causal language models",
-    author="Your Name",
+    author="Marc harary",
     packages=find_packages(exclude=("tests", "configs", "scripts")),
     python_requires=">=3.8",
     install_requires=[
