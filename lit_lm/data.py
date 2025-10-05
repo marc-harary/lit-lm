@@ -5,17 +5,25 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 import pytorch_lightning as pl
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
 def _maybe_load(path_or_name: str, dataset_config: str | None = None):
     if os.path.exists(path_or_name):
         return load_from_disk(path_or_name)
-    return load_dataset(path_or_name, dataset_config) if dataset_config else load_dataset(path_or_name)
+    return (
+        load_dataset(path_or_name, dataset_config)
+        if dataset_config
+        else load_dataset(path_or_name)
+    )
+
 
 class TextDatasets(pl.LightningDataModule):
     def __init__(
         self,
         batch_size: int,
-        dataset_name: str,                    # e.g. "wikitext" or local path
-        dataset_config: str | None = None,    # e.g. "wikitext-2-raw-v1"
+        dataset_name: str,  # e.g. "wikitext" or local path
+        dataset_config: str | None = None,  # e.g. "wikitext-2-raw-v1"
         pretrained_model_name_or_path: str = "gpt2",
         text_key: str = "text",
         max_length: int = 1024,
