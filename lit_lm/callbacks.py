@@ -1,5 +1,6 @@
 import copy
 from argparse import Namespace
+import tempfile
 
 import torch
 from pytorch_lightning import Callback
@@ -10,14 +11,15 @@ import wandb
 
 def normalize_lists(obj):
     """
-    Recursively replace all Python lists with dictionaries keyed by index.
+    Recursively replace all Python lists and tuples with dictionaries
+    keyed by index.
 
-    This ensures that every list element becomes accessible as an individual
-    key-value pair (e.g., "betas.0", "betas.1") when flattened later, so that
-    config values are searchable in W&B rather than hidden in opaque JSON blobs.
+    This ensures every element in a sequence is exposed as an individual
+    key-value pair (e.g., "betas.0", "betas.1") when flattened later,
+    instead of being hidden inside a JSON array.
     """
-    if isinstance(obj, list):
-        # Replace list with a dict where keys are string indices ("0","1",...)
+    if isinstance(obj, (list, tuple)):
+        # Replace sequence with dict {"0": val0, "1": val1, ...}
         return {str(i): normalize_lists(v) for i, v in enumerate(obj)}
     elif isinstance(obj, dict):
         # Recurse into nested dictionaries
@@ -31,21 +33,19 @@ def ns_to_dict(obj):
     """
     Recursively convert argparse.Namespace objects into plain Python dicts.
 
-    Handles nested Namespaces, dicts, and lists/tuples. Scalars are returned as-is.
-    This normalizes Hydra/LightningCLI configs into a uniform dictionary structure
-    before applying list normalization and flattening.
+    Handles:
+      - Namespace → dict
+      - dict → dict (recursively processed)
+      - list/tuple → list of dicts
+      - scalars → unchanged
     """
     if isinstance(obj, Namespace):
-        # Convert Namespace attributes to dict entries
         return {k: ns_to_dict(v) for k, v in vars(obj).items()}
     elif isinstance(obj, dict):
-        # Recurse into dictionaries
         return {k: ns_to_dict(v) for k, v in obj.items()}
     elif isinstance(obj, (list, tuple)):
-        # Recurse into each element of list/tuple
         return [ns_to_dict(v) for v in obj]
     else:
-        # Base case: return unchanged
         return obj
 
 
@@ -53,46 +53,47 @@ class LoggerSaveConfigCallback(SaveConfigCallback):
     """
     Custom callback to log Hydra/LightningCLI config into Weights & Biases (W&B).
 
-    Steps:
-      1. Convert config (Namespace/DictConfig) into a clean Python dict.
-      2. Normalize lists into dicts with numeric keys.
-      3. Flatten nested dicts into dotted-key strings.
-      4. Push flattened config to W&B so all params are searchable.
-      5. Save the full unflattened config as a YAML artifact for reproducibility.
+    Workflow:
+      1. Convert config (Namespace/DictConfig) into a plain dict.
+      2. Normalize all sequences (lists/tuples) into index-keyed dicts.
+      3. Flatten nested dicts into dot-separated keys.
+      4. Push flattened config into W&B for searchability.
+      5. Save full unflattened config as a YAML artifact for reproducibility.
     """
 
     def save_config(self, trainer, pl_module, stage: str) -> None:
         if isinstance(trainer.logger, WandbLogger):
-            # Step 1: recursively convert Namespace to dict
+            # Step 1: normalize Namespace → dict
             cfg_dict = ns_to_dict(self.config)
 
-            # Step 2: normalize lists everywhere (e.g., callbacks, betas)
+            # Step 2: replace all lists/tuples with index-keyed dicts
             cfg_dict = normalize_lists(cfg_dict)
 
-            # Step 3: flatten nested dictionaries into dot-separated keys
+            # Step 3: flatten nested dicts into dotted keys
             def _flatten(d, parent_key="", sep="."):
                 items = []
                 for k, v in d.items():
-                    # Build new dotted key path
                     new_key = f"{parent_key}{sep}{k}" if parent_key else k
                     if isinstance(v, dict):
-                        # Recurse deeper
                         items.extend(_flatten(v, new_key, sep=sep).items())
                     else:
-                        # Leaf node: append key-value pair
                         items.append((new_key, v))
                 return dict(items)
 
             flat_cfg = _flatten(cfg_dict)
 
-            # Step 4: update W&B run config with flattened key-value pairs
+            # Step 4: update W&B config with all flattened keys
             trainer.logger.experiment.config.update(flat_cfg, allow_val_change=True)
 
-            # Step 5: also save the full unflattened config to disk as artifact
-            with open("config_dump.yaml", "w") as f:
-                f.write(str(cfg_dict))
+            # Step 5: save full config as a temporary artifact
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".yaml", delete=False
+            ) as tmp:
+                tmp.write(str(cfg_dict))
+                tmp_path = tmp.name
+
             artifact = wandb.Artifact(name="experiment-config", type="config")
-            artifact.add_file("config_dump.yaml")
+            artifact.add_file(tmp_path)
             trainer.logger.experiment.log_artifact(artifact)
 
 
