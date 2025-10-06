@@ -4,29 +4,34 @@ trainer:
   logger:
     class_path: pytorch_lightning.loggers.WandbLogger
     init_args:
-      project: bema 
-      entity: pyle-lab
+      project: BEMA 
       settings:
         code_dir: ./lit_lm
-  accelerator: gpu
-  strategy: auto
-  devices: -1
+  limit_val_batches: 200
+  val_check_interval: 200
   num_nodes: 1
   precision: bf16-mixed
-  callbacks: null
+  callbacks:
+    - class_path: lit_lm.callbacks.BEMACallback
+      init_args:
+        disable: true
+        update_freq: 10
+        ema_power: 0.999
+        eta_power: 0.2
+        update_after: 0
+        scaling_lag: 10
+        ema_gamma: 1.0
+        min_ema_multiplier: 0.0
+        use_adam_curvature: true
   max_epochs: 1
-  max_steps: -1
-  val_check_interval: 100
-  log_every_n_steps: 10
-  accumulate_grad_batches: 2
-  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
 model:
   pretrained_model_name_or_path: gpt2
 data:
-  batch_size: 8
+  batch_size: 1
   dataset_name: wikitext
   dataset_config: wikitext-2-raw-v1
-  pretrained_model_name_or_path: gpt2
+  pretrained_model_name_or_path: ${model.pretrained_model_name_or_path}
   text_key: text
   max_length: 512
   num_workers: 4
@@ -37,13 +42,6 @@ optimizer:
     betas:
     - 0.9
     - 0.999
-    eps: 1.0e-08
     weight_decay: 0.01
-    amsgrad: false
-    maximize: false
-    foreach: null
-    capturable: false
-    differentiable: false
-    fused: null
 lr_scheduler: null
 ckpt_path: null

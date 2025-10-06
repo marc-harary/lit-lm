@@ -62,7 +62,7 @@ class LitLM(pl.LightningModule):
             correct.mean() if mask.any() else torch.tensor(0.0, device=self.device)
         )
         acc.update(acc_val)
-        self.log(f"{stage}_token_acc", acc, prog_bar=True, on_step=True, on_epoch=True)
+        self.log(f"{stage}/acc", acc, prog_bar=True, on_step=True, on_epoch=True)
 
         return step_dict
 
@@ -85,5 +85,4 @@ class LitLM(pl.LightningModule):
         return step_dict["loss"]
 
     def configure_optimizers(self):
-        # Hydra/LightningCLI supplies optimizer
         return None
