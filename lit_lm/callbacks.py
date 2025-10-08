@@ -1,8 +1,10 @@
 import copy
 from argparse import Namespace
 import tempfile
+from ema_pytorch import EMA
 
 import torch
+from torch import nn
 from pytorch_lightning import Callback
 from pytorch_lightning.cli import SaveConfigCallback
 from pytorch_lightning.loggers import WandbLogger
@@ -99,148 +101,172 @@ class LoggerSaveConfigCallback(SaveConfigCallback):
 
 class BEMACallback(Callback):
     """
-    Bias-Corrected Exponential Moving Average (BEMA)
-    with optional curvature scaling from Adam's exp_avg_sq.
+    Bias-Corrected Exponential Moving Average (BEMA) Callback for PyTorch Lightning.
+
+    Maintains a moving average of model parameters, optionally with bias correction
+    anchored to the initialization. Implements the update scheme described in
+    the BEMA paper (arXiv:2508.00180), with polynomially decaying schedules.
+
+    Update rule (when bias_power is not None):
+        α_t = (ρ + γ t)^(-η)
+        β_t = (ρ + γ t)^(-κ)
+        μ_EMA ← (1 - β_t) μ_EMA + β_t θ_t
+        μ ← α_t (θ_t - θ_0) + μ_EMA
+
+    If bias_power=None, the update reduces to standard EMA:
+        β_t = (ρ + γ t)^(-κ)
+        μ ← (1 - β_t) μ + β_t θ_t
+
+    Args:
+        ema_power (float): κ, power exponent for EMA decay. Default = 0.6 (paper).
+        bias_power (float or None): η, power exponent for bias correction.
+            If None, disables bias correction (plain EMA). Default = 0.4 (paper).
+        multiplier (float): γ, multiplier applied to time t. Default = 1.0.
+        lag (float): ρ, lag term to stabilize denominators. Default = 0.0.
+        burn_in (int): τ, number of steps before applying BEMA. Default = 0.
+        frequency (int): φ, only update every φ steps. Default = 1 (update every step).
+        apply_on_validation (bool): If True, swaps in averaged weights at validation.
     """
 
     def __init__(
         self,
-        update_freq: int = 100,
-        ema_power: float = 0.5,
-        eta_power: float = 0.2,
-        update_after: int = 0,
-        scaling_lag: int = 10,
-        ema_gamma: float = 1.0,
-        min_ema_multiplier: float = 0.0,
-        use_adam_curvature: bool = True,
-        disable: bool = False,
+        ema_power: float = 0.6,
+        bias_power: float | None = 0.4,
+        multiplier: float = 1.0,
+        lag: float = 0.0,
+        burn_in: int = 0,
+        frequency: int = 1,
+        apply_on_validation: bool = True,
     ):
         super().__init__()
-        # hyperparameters
-        self.update_freq = update_freq
         self.ema_power = ema_power
-        self.eta_power = eta_power
-        self.update_after = update_after or 0
-        self.scaling_lag = scaling_lag
-        self.ema_gamma = ema_gamma
-        self.min_ema_multiplier = min_ema_multiplier
-        self.use_adam_curvature = use_adam_curvature
-        self.disable = disable
+        self.bias_power = bias_power
+        self.multiplier = multiplier
+        self.lag = lag
+        self.burn_in = burn_in
+        self.frequency = frequency
+        self.apply_on_validation = apply_on_validation
 
-        # state
-        self.initialized = False
-        self.param_names = []
-        self.thetat_params = []
-        self.theta0_params = []
-        self.ema_params = []
-        self.running_model = None
+        # State
+        self.step_count = 0
+        self.theta0 = None
+        self.mu_ema = {}
+        self.mu = {}
+        self._online_params = None
 
-    # -----------------------------
-    # decay schedules
-    # -----------------------------
-    def _ema_beta(self, t: int) -> float:
-        if self.ema_power < 0:
-            return 1.0
-        beta = (1 + self.ema_gamma * t) ** (-self.ema_power)
-        return max(beta, self.min_ema_multiplier)
-
-    def _bema_alpha(self, t: int) -> float:
-        if self.eta_power < 0:
-            return 0.0
-        return (1 + self.ema_gamma * t) ** (-self.eta_power)
-
-    # -----------------------------
-    # Lightning hooks
-    # -----------------------------
-    @torch.no_grad()
     def on_fit_start(self, trainer, pl_module):
-        if self.disable:
+        state = pl_module.state_dict()
+        self.theta0 = {k: v.detach().clone() for k, v in state.items()}
+        self.mu_ema = {k: v.detach().clone() for k, v in state.items()}
+        self.mu = {k: v.detach().clone() for k, v in state.items()}
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        self.step_count += 1
+        t = self.step_count
+        state_dict = pl_module.state_dict()
+
+        if t <= self.burn_in:
+            self.theta0 = {k: v.detach().clone() for k, v in state_dict.items()}
+            self.mu_ema = {k: v.detach().clone() for k, v in state_dict.items()}
+            self.mu = {k: v.detach().clone() for k, v in state_dict.items()}
             return
 
-        device = pl_module.device
-        self.running_model = copy.deepcopy(pl_module).to(device)
+        if (t - self.burn_in) % self.frequency != 0:
+            return
 
+        beta_t = (self.lag + self.multiplier * t) ** (-self.ema_power)
+        if self.bias_power is None:
+            alpha_t = None
+        else:
+            alpha_t = (self.lag + self.multiplier * t) ** (-self.bias_power)
+
+        with torch.no_grad():
+            for k, p in state_dict.items():
+                p_t = p.detach()
+
+                # Always update EMA
+                self.mu_ema[k].mul_(1 - beta_t).add_(beta_t * p_t)
+
+                if alpha_t is None:
+                    # Plain EMA
+                    self.mu[k] = self.mu_ema[k]
+                else:
+                    # Bias-corrected EMA
+                    self.mu[k] = alpha_t * (p_t - self.theta0[k]) + self.mu_ema[k]
+
+    def on_validation_start(self, trainer, pl_module):
+        if not self.apply_on_validation:
+            return
+        self._online_params = {
+            k: v.detach().clone() for k, v in pl_module.state_dict().items()
+        }
+        new_state = {k: v for k, v in self.mu.items()}
+        pl_module.load_state_dict(new_state, strict=False)
+
+    def on_validation_end(self, trainer, pl_module):
+        if not self.apply_on_validation or self._online_params is None:
+            return
+        pl_module.load_state_dict(self._online_params, strict=False)
+        self._online_params = None
+
+    def state_dict(self):
+        return {
+            "step_count": self.step_count,
+            "theta0": self.theta0,
+            "mu_ema": self.mu_ema,
+            "mu": self.mu,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.step_count = state_dict["step_count"]
+        self.theta0 = state_dict["theta0"]
+        self.mu_ema = state_dict["mu_ema"]
+        self.mu = state_dict["mu"]
+
+
+class EMACallback(Callback):
+    def __init__(self, beta: float = 0.999):
+        super().__init__()
+        self.beta = beta
+        self.ema_state = None
+        self.online_state = None  # for restoring after validation
+
+    def on_fit_start(self, trainer, pl_module):
+        # initialize EMA copy of parameters
+        self.ema_state = {
+            name: p.detach().clone()
+            for name, p in pl_module.named_parameters()
+            if p.requires_grad
+        }
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # EMA update rule
         for name, p in pl_module.named_parameters():
             if not p.requires_grad:
                 continue
-            self.param_names.append(name)
-            self.thetat_params.append(p)
+            self.ema_state[name].mul_(self.beta).add_(p.detach(), alpha=1 - self.beta)
 
-            theta0_buf = p.data.detach().clone().to(device)
-            ema_buf = theta0_buf.clone()
-            self.theta0_params.append(theta0_buf)
-            self.ema_params.append(ema_buf)
+    def on_validation_start(self, trainer, pl_module):
+        # store online weights
+        self.online_state = {
+            name: p.detach().clone()
+            for name, p in pl_module.named_parameters()
+            if p.requires_grad
+        }
+        # swap in EMA weights
+        for name, p in pl_module.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self.ema_state[name])
 
-        self.initialized = False
+    def on_validation_end(self, trainer, pl_module):
+        # restore online weights
+        for name, p in pl_module.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self.online_state[name])
+        self.online_state = None
 
-    @torch.no_grad()
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if self.disable:
-            return
+    def state_dict(self):
+        return {"ema_state": self.ema_state}
 
-        step = trainer.global_step
-        if step is None:
-            return
-
-        device = pl_module.device
-
-        # init snapshot θ₀ and EMA
-        if not self.initialized and step >= self.update_after:
-            for p, theta0, ema in zip(
-                self.thetat_params, self.theta0_params, self.ema_params
-            ):
-                data = p.data.detach().to(device)
-                theta0.copy_(data)
-                ema.copy_(data)
-            self.initialized = True
-
-        if not self.initialized or step % self.update_freq != 0:
-            return
-
-        # compute decay factors
-        t = max(step - self.update_after + self.scaling_lag, 1)
-        beta = self._ema_beta(t)
-        alpha = self._bema_alpha(t)
-
-        # gather θₜ
-        new_thetas = [
-            p.data.detach().to(device, non_blocking=True) for p in self.thetat_params
-        ]
-
-        # EMA update
-        torch._foreach_mul_(self.ema_params, 1 - beta)
-        torch._foreach_add_(self.ema_params, new_thetas, alpha=beta)
-
-        # BEMA correction term
-        deltas = [theta.clone() for theta in new_thetas]
-        torch._foreach_sub_(deltas, self.theta0_params)  # θₜ − θ₀
-        torch._foreach_mul_(deltas, alpha)  # α·(θₜ − θ₀)
-
-        # curvature scaling (Adam second moment)
-        if self.use_adam_curvature and len(trainer.optimizers) > 0:
-            opt = trainer.optimizers[0]
-            beta2 = opt.param_groups[0]["betas"][1]
-            eps = opt.param_groups[0].get("eps", 1e-8)
-
-            v_hats = []
-            for p in self.thetat_params:
-                st = opt.state[p]
-                if "exp_avg_sq" in st:
-                    v = st["exp_avg_sq"]
-                    step_count = st.get("step", 1)
-                    v_hat = v / (1 - beta2**step_count)
-                    v_hats.append(v_hat.sqrt().to(device))
-                else:
-                    v_hats.append(torch.ones_like(p, device=device))
-
-            for d, vhat in zip(deltas, v_hats):
-                d.div_(vhat + eps)
-
-        # add EMA + corrected deltas
-        torch._foreach_add_(deltas, self.ema_params)
-
-        # write back to running_model
-        sd_run = self.running_model.state_dict()
-        for name, corr in zip(self.param_names, deltas):
-            sd_run[name].copy_(corr)
-        self.running_model.load_state_dict(sd_run, strict=False)
+    def load_state_dict(self, state_dict):
+        self.ema_state = state_dict["ema_state"]

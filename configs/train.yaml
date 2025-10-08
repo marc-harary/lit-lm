@@ -9,20 +9,13 @@ trainer:
         code_dir: ./lit_lm
   limit_val_batches: 200
   val_check_interval: 200
-  num_nodes: 1
   precision: bf16-mixed
   callbacks:
     - class_path: lit_lm.callbacks.BEMACallback
       init_args:
-        disable: true
-        update_freq: 10
         ema_power: 0.999
-        eta_power: 0.2
-        update_after: 0
-        scaling_lag: 10
-        ema_gamma: 1.0
-        min_ema_multiplier: 0.0
-        use_adam_curvature: true
+        bias_power: null
+        frequency: 10
   max_epochs: 1
   accumulate_grad_batches: 1
 model:
@@ -38,10 +31,7 @@ data:
 optimizer:
   class_path: torch.optim.AdamW
   init_args:
-    lr: 3.0e-05
-    betas:
-    - 0.9
-    - 0.999
+    lr: 1.0e-03
     weight_decay: 0.01
 lr_scheduler: null
 ckpt_path: null
