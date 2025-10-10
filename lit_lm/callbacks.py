@@ -1,7 +1,6 @@
 import copy
 from argparse import Namespace
 import tempfile
-from ema_pytorch import EMA
 
 import torch
 from torch import nn
@@ -101,31 +100,23 @@ class LoggerSaveConfigCallback(SaveConfigCallback):
 
 class BEMACallback(Callback):
     """
-    Bias-Corrected Exponential Moving Average (BEMA) Callback for PyTorch Lightning.
+    Bias-Corrected Exponential Moving Average (BEMA) for model parameters.
 
-    Maintains a moving average of model parameters, optionally with bias correction
-    anchored to the initialization. Implements the update scheme described in
-    the BEMA paper (arXiv:2508.00180), with polynomially decaying schedules.
-
-    Update rule (when bias_power is not None):
-        α_t = (ρ + γ t)^(-η)
-        β_t = (ρ + γ t)^(-κ)
-        μ_EMA ← (1 - β_t) μ_EMA + β_t θ_t
-        μ ← α_t (θ_t - θ_0) + μ_EMA
-
-    If bias_power=None, the update reduces to standard EMA:
-        β_t = (ρ + γ t)^(-κ)
-        μ ← (1 - β_t) μ + β_t θ_t
+    Features:
+      • Standard EMA (always).
+      • Bias correction term α_t(θ_t - θ0), optionally preconditioned with Adam's second moments.
+      • Burn-in τ, update frequency φ, polynomial decay schedules for EMA/bias.
+      • Stores shadow copies of EMA and BEMA weights for validation/eval.
 
     Args:
-        ema_power (float): κ, power exponent for EMA decay. Default = 0.6 (paper).
-        bias_power (float or None): η, power exponent for bias correction.
-            If None, disables bias correction (plain EMA). Default = 0.4 (paper).
-        multiplier (float): γ, multiplier applied to time t. Default = 1.0.
-        lag (float): ρ, lag term to stabilize denominators. Default = 0.0.
-        burn_in (int): τ, number of steps before applying BEMA. Default = 0.
-        frequency (int): φ, only update every φ steps. Default = 1 (update every step).
-        apply_on_validation (bool): If True, swaps in averaged weights at validation.
+        ema_power (float): κ exponent for EMA decay schedule.
+        bias_power (float|None): η exponent for bias correction. If None → pure EMA.
+        multiplier (float): γ scaling of schedule.
+        lag (float): ρ lag offset.
+        burnin (int): τ burn-in steps before applying stabilization.
+        frequency (int): φ update frequency.
+        use_adam_precond (bool): whether to use Adam's exp_avg_sq for bias correction preconditioning.
+        eps (float): epsilon for Adam preconditioner stability.
     """
 
     def __init__(
@@ -134,139 +125,127 @@ class BEMACallback(Callback):
         bias_power: float | None = 0.4,
         multiplier: float = 1.0,
         lag: float = 0.0,
-        burn_in: int = 0,
+        burnin: int = 0,
         frequency: int = 1,
-        apply_on_validation: bool = True,
+        use_adam_precond: bool = False,
+        eps: float = 1e-8,
     ):
         super().__init__()
         self.ema_power = ema_power
         self.bias_power = bias_power
         self.multiplier = multiplier
         self.lag = lag
-        self.burn_in = burn_in
+        self.burnin = burnin
         self.frequency = frequency
-        self.apply_on_validation = apply_on_validation
+        self.use_adam_precond = use_adam_precond
+        self.eps = eps
 
-        # State
-        self.step_count = 0
-        self.theta0 = None
-        self.mu_ema = {}
-        self.mu = {}
-        self._online_params = None
-
-    def on_fit_start(self, trainer, pl_module):
-        state = pl_module.state_dict()
-        self.theta0 = {k: v.detach().clone() for k, v in state.items()}
-        self.mu_ema = {k: v.detach().clone() for k, v in state.items()}
-        self.mu = {k: v.detach().clone() for k, v in state.items()}
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        self.step_count += 1
-        t = self.step_count
-        state_dict = pl_module.state_dict()
-
-        if t <= self.burn_in:
-            self.theta0 = {k: v.detach().clone() for k, v in state_dict.items()}
-            self.mu_ema = {k: v.detach().clone() for k, v in state_dict.items()}
-            self.mu = {k: v.detach().clone() for k, v in state_dict.items()}
-            return
-
-        if (t - self.burn_in) % self.frequency != 0:
-            return
-
-        beta_t = (self.lag + self.multiplier * t) ** (-self.ema_power)
-        if self.bias_power is None:
-            alpha_t = None
-        else:
-            alpha_t = (self.lag + self.multiplier * t) ** (-self.bias_power)
-
-        with torch.no_grad():
-            for k, p in state_dict.items():
-                p_t = p.detach()
-
-                # Always update EMA
-                self.mu_ema[k].mul_(1 - beta_t).add_(beta_t * p_t)
-
-                if alpha_t is None:
-                    # Plain EMA
-                    self.mu[k] = self.mu_ema[k]
-                else:
-                    # Bias-corrected EMA
-                    self.mu[k] = alpha_t * (p_t - self.theta0[k]) + self.mu_ema[k]
-
-    def on_validation_start(self, trainer, pl_module):
-        if not self.apply_on_validation:
-            return
-        self._online_params = {
-            k: v.detach().clone() for k, v in pl_module.state_dict().items()
-        }
-        new_state = {k: v for k, v in self.mu.items()}
-        pl_module.load_state_dict(new_state, strict=False)
-
-    def on_validation_end(self, trainer, pl_module):
-        if not self.apply_on_validation or self._online_params is None:
-            return
-        pl_module.load_state_dict(self._online_params, strict=False)
-        self._online_params = None
-
-    def state_dict(self):
-        return {
-            "step_count": self.step_count,
-            "theta0": self.theta0,
-            "mu_ema": self.mu_ema,
-            "mu": self.mu,
-        }
-
-    def load_state_dict(self, state_dict):
-        self.step_count = state_dict["step_count"]
-        self.theta0 = state_dict["theta0"]
-        self.mu_ema = state_dict["mu_ema"]
-        self.mu = state_dict["mu"]
-
-
-class EMACallback(Callback):
-    def __init__(self, beta: float = 0.999):
-        super().__init__()
-        self.beta = beta
-        self.ema_state = None
-        self.online_state = None  # for restoring after validation
+        # Internal state
+        self.mu = {}  # bias-corrected EMA weights
+        self.mu_ema = {}  # standard EMA weights
+        self.theta0 = {}  # initial weights
+        self.t = 0  # step counter
 
     def on_fit_start(self, trainer, pl_module):
-        # initialize EMA copy of parameters
-        self.ema_state = {
-            name: p.detach().clone()
-            for name, p in pl_module.named_parameters()
-            if p.requires_grad
-        }
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        # EMA update rule
+        """Initialize buffers with model parameters."""
         for name, p in pl_module.named_parameters():
             if not p.requires_grad:
                 continue
-            self.ema_state[name].mul_(self.beta).add_(p.detach(), alpha=1 - self.beta)
+            self.mu[name] = p.detach().clone().float()
+            self.mu_ema[name] = p.detach().clone().float()
+            self.theta0[name] = p.detach().clone().float()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Update EMA and BEMA after each batch."""
+        self.t += 1
+        t = self.t
+
+        # Skip until burn-in
+        if t <= self.burnin:
+            for name, p in pl_module.named_parameters():
+                if not p.requires_grad:
+                    continue
+                self.mu[name] = p.detach().clone().float()
+                self.mu_ema[name] = p.detach().clone().float()
+                self.theta0[name] = p.detach().clone().float()
+            return
+
+        # Update only every φ steps
+        if (t - self.burnin) % self.frequency != 0:
+            return
+
+        beta_t = (self.lag + self.multiplier * t) ** (-self.ema_power)
+        alpha_t = (
+            None
+            if self.bias_power is None
+            else (self.lag + self.multiplier * t) ** (-self.bias_power)
+        )
+
+        # Grab optimizer state if Adam preconditioner enabled
+        opt = trainer.optimizers[0] if self.use_adam_precond else None
+        beta2 = None
+        if opt is not None:
+            beta2 = opt.param_groups[0]["betas"][1]  # assumes all groups share beta2
+
+        with torch.no_grad():
+            for name, p in pl_module.named_parameters():
+                if not p.requires_grad:
+                    continue
+
+                p_t = p.detach()
+                # EMA update
+                self.mu_ema[name].mul_(1 - beta_t).add_(p_t, alpha=beta_t)
+
+                # If no bias correction, fallback to EMA
+                if alpha_t is None:
+                    self.mu[name] = self.mu_ema[name]
+                    continue
+
+                # Optional Adam-preconditioned correction
+                if self.use_adam_precond and name in opt.state[p]:
+                    st = opt.state[p]
+                    if "exp_avg_sq" in st:
+                        v = st["exp_avg_sq"]
+                        denom = max(1.0 - (beta2**t), 1e-8)
+                        v_hat = v / denom
+                        scale = v_hat.sqrt().add_(self.eps)
+                        corr = (p_t - self.theta0[name]) / scale
+                    else:
+                        corr = p_t - self.theta0[name]
+                else:
+                    corr = p_t - self.theta0[name]
+
+                self.mu[name] = self.mu_ema[name] + alpha_t * corr
 
     def on_validation_start(self, trainer, pl_module):
-        # store online weights
-        self.online_state = {
-            name: p.detach().clone()
-            for name, p in pl_module.named_parameters()
-            if p.requires_grad
-        }
-        # swap in EMA weights
-        for name, p in pl_module.named_parameters():
-            if p.requires_grad:
-                p.data.copy_(self.ema_state[name])
+        """Swap in BEMA weights for evaluation."""
+        self.backup = {}
+        with torch.no_grad():
+            for name, p in pl_module.named_parameters():
+                if not p.requires_grad:
+                    continue
+                self.backup[name] = p.detach().clone()
+                p.copy_(self.mu[name])
 
     def on_validation_end(self, trainer, pl_module):
-        # restore online weights
-        for name, p in pl_module.named_parameters():
-            if p.requires_grad:
-                p.data.copy_(self.online_state[name])
-        self.online_state = None
+        """Restore original weights after validation."""
+        with torch.no_grad():
+            for name, p in pl_module.named_parameters():
+                if not p.requires_grad:
+                    continue
+                p.copy_(self.backup[name])
+        self.backup = None
 
     def state_dict(self):
-        return {"ema_state": self.ema_state}
+        return {
+            "t": self.t,
+            "mu": self.mu,
+            "mu_ema": self.mu_ema,
+            "theta0": self.theta0,
+        }
 
     def load_state_dict(self, state_dict):
-        self.ema_state = state_dict["ema_state"]
+        self.t = state_dict["t"]
+        self.mu = state_dict["mu"]
+        self.mu_ema = state_dict["mu_ema"]
+        self.theta0 = state_dict["theta0"]
